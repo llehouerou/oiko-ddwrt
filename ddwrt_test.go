@@ -1,10 +1,12 @@
 package oikoddwrt
 
 import (
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -79,6 +81,60 @@ func TestDDWRT(t *testing.T) {
 	})
 }
 
+// TestOffline follows the router not answering, then refusing the password,
+// then answering again: the Bridge goes offline and its phones' Availability
+// unknown, each failure logged once, and the next good poll brings it back.
+func TestOffline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		router := &fakeRouter{wireless: wireless(alice)}
+		var logs logBuffer
+		h := start(t, router, `"alice": {"name": "Alice's phone", "mac": "02:00:00:00:00:0a"}`,
+			func(b *Bridge) { b.log = slog.New(slog.NewTextHandler(&logs, nil)) })
+		assertOnline := func(when string, want bool) {
+			t.Helper()
+			availability := map[bool]bridge.Availability{true: bridge.Online, false: bridge.Unknown}[want]
+			if h.Online() != want || h.Availability("alice") != availability {
+				t.Errorf("%s: online %v, alice %s; want %v, %s", when, h.Online(), h.Availability("alice"), want, availability)
+			}
+		}
+		assertOnline("replayed", true)
+
+		// The router hangs: the poll times out, and the next one too.
+		router.setHanging(true)
+		time.Sleep(2 * pollEvery)
+		synctest.Wait()
+		assertOnline("hanging", false)
+
+		// Its password was changed: a 401, logged as a credentials error.
+		router.setHanging(false)
+		router.setPassword("changed")
+		time.Sleep(2 * pollEvery)
+		synctest.Wait()
+		assertOnline("401", false)
+
+		// The router takes the password again; Alice has left meanwhile.
+		router.setPassword("secret")
+		router.set(wireless())
+		time.Sleep(pollEvery)
+		synctest.Wait()
+		assertOnline("back", true)
+		assertConnected(t, h, map[string]bool{"alice": false})
+
+		lines := logs.lines()
+		if len(lines) != 3 ||
+			!strings.Contains(lines[0], "Status_Wireless.live.asp: no answer within 10s") ||
+			!strings.Contains(lines[1], "Status_Wireless.live.asp: the router refuses the credentials: check username and passwordFile") ||
+			!strings.Contains(lines[2], "answers again") {
+			t.Errorf("logs:\n%s\nwant a timeout, a credentials error, then back, each once", strings.Join(lines, "\n"))
+		}
+		for _, l := range lines {
+			if strings.Contains(l, "secret") || strings.Contains(l, "changed") {
+				t.Errorf("log %q holds a password", l)
+			}
+		}
+	})
+}
+
 // A phone whose MAC rotated is re-bound by editing its mac: the key, its
 // Native Address, stays.
 func TestRotatedMAC(t *testing.T) {
@@ -111,12 +167,14 @@ func TestParse(t *testing.T) {
 	}{
 		{string(page), []string{"02:00:00:00:00:0a", "02:00:00:00:00:0c"}},
 		{"{wl_ssid::Example}\n{active_wireless::}\n{assoc_count::0}", nil},
+		{"<html>A captive portal</html>", nil},                                     // an error: no active_wireless
 		{wireless(alice, bob), []string{"02:00:00:00:00:0a", "02:00:00:00:00:0b"}}, // the current source's, twenty values a client
 		// An older Broadcom build's, nine values a client.
 		{"{active_wireless::'02:00:00:00:00:0B','eth1','2:00:00','54M','54M','-60','-92','32','640'}", []string{"02:00:00:00:00:0b"}},
 	} {
 		r.client.Transport = network{"router.example": &fakeRouter{wireless: c.page}}
-		if got, err := r.associated(t.Context()); err != nil || !slices.Equal(got, c.want) {
+		got, err := r.associated(t.Context())
+		if portal := c.page[0] == '<'; portal != (err != nil) || !slices.Equal(got, c.want) {
 			t.Errorf("associated = %q, %v; want %q", got, err, c.want)
 		}
 	}
@@ -194,13 +252,17 @@ func TestManifest(t *testing.T) {
 }
 
 // start runs a Bridge with phones, reaching router, until the test ends, and
-// returns its home once the Bridge waits for its next poll.
-func start(t *testing.T, router http.Handler, phones string) *bridgetest.Home {
+// returns its home once the Bridge waits for its next poll. Each of adjust
+// changes the Bridge before it runs.
+func start(t *testing.T, router http.Handler, phones string, adjust ...func(*Bridge)) *bridgetest.Home {
 	b, err := open(env(t, phones))
 	if err != nil {
 		t.Fatal(err)
 	}
 	b.(*Bridge).router.client.Transport = network{"router.example": router}
+	for _, f := range adjust {
+		f(b.(*Bridge))
+	}
 	h := bridgetest.New(b)
 	go b.Run(t.Context(), h.Port())
 	synctest.Wait()
@@ -243,16 +305,23 @@ func wireless(macs ...string) string {
 }
 
 // fakeRouter is a DD-WRT router's web interface, which asks for admin and
-// secret.
+// its password, secret unless set.
 type fakeRouter struct {
 	mu       sync.Mutex
 	wireless string // Status_Wireless.live.asp
+	password string
+	hanging  bool // answering nothing
 }
 
 func (f *fakeRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
+	if f.hanging {
+		f.mu.Unlock()
+		<-r.Context().Done() // until the client times out
+		return
+	}
 	defer f.mu.Unlock()
-	if user, password, _ := r.BasicAuth(); user != "admin" || password != "secret" {
+	if user, password, _ := r.BasicAuth(); user != "admin" || password != cmp.Or(f.password, "secret") {
 		w.Header().Set("WWW-Authenticate", `Basic realm="DD-WRT"`)
 		http.Error(w, "Authorization required", http.StatusUnauthorized)
 		return
@@ -271,9 +340,40 @@ func (f *fakeRouter) set(wireless string) {
 	f.wireless = wireless
 }
 
+func (f *fakeRouter) setPassword(password string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.password = password
+}
+
+func (f *fakeRouter) setHanging(hanging bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.hanging = hanging
+}
+
+// logBuffer is a log the Bridge writes while the test reads it.
+type logBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (l *logBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *logBuffer) lines() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Split(strings.TrimSpace(l.buf.String()), "\n")
+}
+
 // network is an in-memory LAN, an http.RoundTripper: each host's handler
 // answers its requests, with no socket, so synctest.Wait sees the Bridge idle
-// and the poll's ticker fast-forwards. Any other host is unreachable.
+// and the poll's ticker and the client's timeout fast-forward. Any other host
+// is unreachable.
 type network map[string]http.Handler
 
 func (n network) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -283,5 +383,8 @@ func (n network) RoundTrip(r *http.Request) (*http.Response, error) {
 	}
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
+	if err := r.Context().Err(); err != nil { // the client gave up: a timeout
+		return nil, err
+	}
 	return w.Result(), nil
 }

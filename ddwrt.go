@@ -88,6 +88,7 @@ type Bridge struct {
 	router *router
 	phones map[string]phone // by key, their MACs in parseMAC's form
 	log    *slog.Logger
+	failed string // the last poll's error, "" if it succeeded; only Run's goroutine touches it
 }
 
 // Run lists the phones, then polls the router until ctx ends.
@@ -106,15 +107,24 @@ func (b *Bridge) Run(ctx context.Context, port bridge.Port) {
 }
 
 // poll reads which clients are associated and reports every phone. The first
-// poll the router answers is the Replay.
+// poll the router answers is the Replay. While it does not, the Bridge is
+// offline, so the phones' Availability is unknown and their Presence sources
+// are ignored rather than read as away.
 func (b *Bridge) poll(ctx context.Context, port bridge.Port) {
 	associated, err := b.router.associated(ctx)
 	switch {
 	case ctx.Err() != nil: // Oiko is stopping: the router is no less reachable
 	case err != nil:
-		b.log.Warn("poll failed", "err", err)
+		if err.Error() != b.failed { // every 30 s: logged when it starts or changes
+			b.log.Warn("the router does not answer", "err", err)
+			b.failed = err.Error()
+		}
 		port.SetOnline(false)
 	default:
+		if b.failed != "" {
+			b.log.Info("the router answers again")
+			b.failed = ""
+		}
 		port.SetOnline(true)
 		for key, p := range b.phones {
 			port.SetAvailability(key, bridge.Online)
@@ -171,13 +181,13 @@ func newRouter(env bridge.Env) (*router, config, error) {
 		return nil, c, fmt.Errorf("ddwrt: passwordFile: %w", err)
 	}
 	return &router{url: u, username: c.Username, password: strings.TrimRight(string(password), "\r\n"),
-		client: &http.Client{Timeout: 10 * time.Second}}, c, nil
+		client: &http.Client{}}, c, nil
 }
 
 // associated lists the MACs of the clients associated with the access point
-// now: the page's active_wireless, the radio's associations.
+// now: the page's active_wireless, the associations of each of its radios.
 func (r *router) associated(ctx context.Context) ([]string, error) {
-	status, err := r.status(ctx, "Status_Wireless.live.asp")
+	status, err := r.status(ctx, "Status_Wireless.live.asp", "active_wireless")
 	if err != nil {
 		return nil, err
 	}
@@ -190,26 +200,46 @@ func (r *router) associated(ctx context.Context) ([]string, error) {
 	return macs, nil
 }
 
-// status reads one of the router's status pages into its fields.
-func (r *router) status(ctx context.Context, page string) (map[string]string, error) {
+// errCredentials is a 401: the router refuses username and the password.
+var errCredentials = errors.New("the router refuses the credentials: check username and passwordFile")
+
+// timeout bounds reading a status page, well under a poll.
+const timeout = 10 * time.Second
+
+// status reads one of the router's status pages into its fields; one that
+// lacks field is no DD-WRT status page.
+func (r *router) status(ctx context.Context, page, field string) (map[string]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout) // not the client's: its error's text varies
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.url.JoinPath(page).String(), nil)
 	if err != nil {
 		return nil, err
 	}
 	req.SetBasicAuth(r.username, r.password)
 	resp, err := r.client.Do(req)
+	if errors.Is(err, context.DeadlineExceeded) {
+		return nil, fmt.Errorf("%s: no answer within %v", page, timeout)
+	}
 	if err != nil {
-		return nil, err
+		return nil, err // a network error; the URL holds no credentials
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusUnauthorized:
+		return nil, fmt.Errorf("%s: %w", page, errCredentials)
+	default:
 		return nil, fmt.Errorf("%s: %s", page, resp.Status)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // a status page is a few kB
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", page, err)
 	}
-	return fields(string(body)), nil
+	fs := fields(string(body))
+	if _, ok := fs[field]; !ok {
+		return nil, fmt.Errorf("%s: no %s: is it a DD-WRT router?", page, field)
+	}
+	return fs, nil
 }
 
 var statusField = regexp.MustCompile(`\{(\w+)::([^}]*)\}`)

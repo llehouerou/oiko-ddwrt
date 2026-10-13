@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question
+    url: https://github.com/llehouerou/oiko/discussions/categories/q-a
+    about: How do I…, why does it…? Ask in Oiko's Discussions › Q&A.
+  - name: Idea
+    url: https://github.com/llehouerou/oiko/discussions/categories/ideas
+    about: A feature you would like. Propose it in Oiko's Discussions › Ideas.
+  - name: Report a vulnerability
+    url: https://github.com/llehouerou/oiko-ddwrt/security/advisories/new
+    about: Never in a public issue. Report it privately, as SECURITY.md says.

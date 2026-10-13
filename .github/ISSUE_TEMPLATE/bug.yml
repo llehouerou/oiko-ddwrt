@@ -1,0 +1,52 @@
+name: Bug report
+description: Something in the ddwrt type of Bridge does not work as it should. A bug in Oiko itself goes on Oiko's repository.
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. …
+        2. …
+    validations:
+      required: true
+  - type: textarea
+    id: version
+    attributes:
+      label: Output of `oiko -version`
+      description: "The Build: Oiko's version and each type of Bridge compiled into it, this one included."
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Router and DD-WRT build
+      description: The router model and its DD-WRT build, as its Status page shows them.
+      placeholder: Linksys WRT3200ACM, DD-WRT r55000…
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: |
+        **Before you paste logs or configuration:** they can hold your router's address, user
+        name and password, MAC addresses, and the names of phones and people. Replace them with
+        made-up ones; this issue is public.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      render: text

@@ -24,12 +24,16 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"github.com/llehouerou/oiko/bridge"
 )
 
-func init() { bridge.Register(bridge.Module{Type: "ddwrt", New: open}) }
+func init() {
+	bridge.Register(bridge.Module{Type: "ddwrt", New: open,
+		Commands: map[string]func(bridge.Env, []string) error{"clients": clients}})
+}
 
 // config is the type's section of "bridges": one access point, and the
 // phones to follow on it. The password is read from the file passwordFile
@@ -151,6 +155,49 @@ func (b *Bridge) devices() []bridge.Device {
 			}}}}})
 	}
 	return ds
+}
+
+// clients is `oiko <bridge> clients`: it prints the clients associated with
+// the access point now, for the Admin to find a phone's mac. It only reads the
+// router, so it is harmless while Oiko serves, and needs no phones yet.
+func clients(env bridge.Env, args []string) error {
+	if len(args) > 0 {
+		return fmt.Errorf("usage: oiko %s clients", env.Name)
+	}
+	r, _, err := newRouter(env)
+	if err != nil {
+		return err
+	}
+	return r.printClients(context.Background(), os.Stdout)
+}
+
+// printClients writes each client associated, its MAC and the host name of
+// its DHCP lease: none when the access point is no DHCP server, or the
+// client keeps a static address.
+func (r *router) printClients(ctx context.Context, w io.Writer) error {
+	associated, err := r.associated(ctx)
+	if err != nil {
+		return fmt.Errorf("ddwrt: %w", err)
+	}
+	lan, err := r.status(ctx, "Status_Lan.live.asp", "dhcp_leases")
+	if err != nil {
+		return fmt.Errorf("ddwrt: %w", err)
+	}
+	// Each lease is 'host name','IP','MAC',… with more values on newer
+	// builds: a host name is two values before its MAC.
+	hosts := map[string]string{}
+	leases := values(lan["dhcp_leases"])
+	for i := 2; i < len(leases); i++ {
+		if mac, ok := parseMAC(leases[i]); ok {
+			hosts[mac] = leases[i-2]
+		}
+	}
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "MAC\tHOST NAME")
+	for _, mac := range associated {
+		fmt.Fprintf(tw, "%s\t%s\n", mac, hosts[mac])
+	}
+	return tw.Flush()
 }
 
 // router reads a DD-WRT router's status pages, as its web interface does.

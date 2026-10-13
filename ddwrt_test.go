@@ -180,6 +180,41 @@ func TestParse(t *testing.T) {
 	}
 }
 
+// TestClients prints the clients associated with their lease host names, for
+// a section with no phones yet, and reports a 401 as a credentials error.
+func TestClients(t *testing.T) {
+	if m, ok := bridge.Lookup("ddwrt"); !ok || m.Commands["clients"] == nil {
+		t.Fatal("no clients command registered")
+	}
+	section := bridgetest.Env(t, "ddwrt", `{"url": "http://router.example", "username": "admin", "passwordFile": "`+passwordFile(t)+`"}`)
+	if err := clients(section, []string{"all"}); err == nil || !strings.Contains(err.Error(), "usage: oiko ddwrt clients") {
+		t.Errorf("clients all: %v, want its usage", err)
+	}
+	r, _, err := newRouter(section)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := &fakeRouter{wireless: wireless(alice, guest),
+		// Leases as a recent build lists them; the guest's phone has none,
+		// another lease's client is gone.
+		lan: `{lan_ip::192.168.1.1/24}
+{dhcp_leases:: 'alice-phone','192.168.1.10','02:00:00:00:00:0A','0 days 20:47:08','10','br0','','Bob-s-laptop','192.168.1.11','02:00:00:00:00:0E','0 days 15:37:32','11','br0',''}
+{arp_table::}`}
+	r.client.Transport = network{"router.example": router}
+	var out strings.Builder
+	if err := r.printClients(t.Context(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if want := "MAC                HOST NAME\n02:00:00:00:00:0a  alice-phone\n02:00:00:00:00:0c  \n"; out.String() != want {
+		t.Errorf("clients:\n%s\nwant:\n%s", out.String(), want)
+	}
+
+	router.setPassword("changed")
+	if err := r.printClients(t.Context(), &out); err == nil || !strings.Contains(err.Error(), "check username and passwordFile") {
+		t.Errorf("clients with a wrong password: %v, want a credentials error", err)
+	}
+}
+
 // TestOpen creates the Bridge as Oiko does, from its section.
 func TestOpen(t *testing.T) {
 	password := passwordFile(t)
@@ -309,6 +344,7 @@ func wireless(macs ...string) string {
 type fakeRouter struct {
 	mu       sync.Mutex
 	wireless string // Status_Wireless.live.asp
+	lan      string // Status_Lan.live.asp
 	password string
 	hanging  bool // answering nothing
 }
@@ -329,6 +365,8 @@ func (f *fakeRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/Status_Wireless.live.asp":
 		io.WriteString(w, f.wireless)
+	case "/Status_Lan.live.asp":
+		io.WriteString(w, f.lan)
 	default:
 		http.NotFound(w, r)
 	}

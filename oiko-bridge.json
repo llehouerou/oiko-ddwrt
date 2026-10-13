@@ -1,0 +1,16 @@
+{
+  "types": {
+    "ddwrt": {
+      "description": "Phones on a DD-WRT access point, read from its status page every 30 seconds: whether each phone you list is connected to its Wi-Fi, to bind it as a Presence source.",
+      "config": {
+        "url": "http://192.168.1.1",
+        "username": "admin",
+        "passwordFile": "/path/to/ddwrt-password",
+        "phones": {
+          "alice": {"name": "Alice's phone", "mac": "02:00:00:00:00:01"},
+          "bob": {"name": "Bob's phone", "mac": "02:00:00:00:00:02"}
+        }
+      }
+    }
+  }
+}
